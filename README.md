@@ -34,7 +34,37 @@ to test it safely and to measure how your touchpad actually behaves.
 | Debian/Ubuntu, Arch | `install.sh`/`uninstall.sh` were tested on a Debian layout; the shim itself is untested there |
 | Other Wayland compositors | The shim hooks libinput, not KWin, so it may work wherever a compositor calls `libinput_device_config_accel_set_speed`/`_set_profile`. Untested; `reload.sh` is KWin-only |
 
-Requirements: libinput ≥ 1.23 (custom profile), glibc ≥ 2.38, x86_64.
+Requirements: glibc (for `/etc/ld.so.preload`), libinput ≥ 1.23 (custom profile),
+x86_64. The shim needs at least the glibc version it was built against. Build on the
+system you install on, or in a container whose glibc is not newer than the host's.
+A build in a `fedora:44` distrobox (as below) needs glibc ≥ 2.38 on the host.
+
+### Distributions
+
+The mechanism is not tied to Bazzite: any glibc distribution honors
+`/etc/ld.so.preload`, and `install.sh` handles the library layouts of Fedora,
+Debian/Ubuntu and Arch. What decides is the libinput version:
+
+| Distribution | libinput | Custom profile |
+|---|---|---|
+| Fedora 38+ / Bazzite, Kinoite | ≥ 1.23 | yes |
+| Debian 13 (trixie) | 1.28 | yes |
+| Debian 12 (bookworm) | 1.22 | **no** |
+| Ubuntu 24.04 LTS and newer | ≥ 1.25 | yes |
+| Ubuntu 22.04 LTS | 1.20 | **no** |
+| Arch, openSUSE Tumbleweed | current | yes |
+| musl-based (Alpine, Void musl) | – | **no**: musl ignores `/etc/ld.so.preload` |
+
+`install.sh` checks both requirements before it installs anything. It looks for
+`libinput_config_accel_create` in the system's `libinput.so.10` (only present from
+1.23 on), and it test-loads the shim via `LD_PRELOAD`, so a build against a too-new
+glibc is caught before it reaches `/etc/ld.so.preload`. Only the 64-bit build is
+test-loaded. A 32-bit build against a too-new glibc would still break 32-bit programs
+such as Steam, so always build both with `make` on the same system.
+
+On distributions with a writable `/usr` you could patch libinput directly instead.
+The shim has the advantage of surviving libinput updates as long as the API stays
+the same.
 
 ## How it works
 
@@ -81,8 +111,10 @@ journalctl -b | grep 'custom curve' | tail -1
 ```
 
 `install.sh` determines the library directories from where your libc lives (Fedora:
-`lib64`/`lib`, Debian: `lib/x86_64-linux-gnu`/`lib32`, Arch: `lib`/`lib32`). It then
-checks that a newly started process loads the shim. If not, it removes its preload
+`lib64`/`lib`, Debian: `lib/x86_64-linux-gnu`/`lib32`, Arch: `lib`/`lib32`). Before
+installing, it checks that libinput is ≥ 1.23 and that the shim loads on this system
+(see [Distributions](#distributions)). Afterwards it checks that a newly started
+process loads the shim. If not, it removes its preload
 entry again and stops. It doesn't overwrite an existing `/etc/touchpad-accel.conf`.
 `/etc` and `/usr/local` survive rpm-ostree/bootc updates.
 

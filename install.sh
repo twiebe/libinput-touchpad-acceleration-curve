@@ -37,6 +37,36 @@ DIRS32=$(lib_dirs_32)
 echo "64-bit library directory: $DIR64"
 echo "32-bit library directories: ${DIRS32:-none (no 32-bit libc installed)}"
 
+# libinput >= 1.23 is required (custom acceleration profile). Older versions lack
+# libinput_config_accel_create; the shim would then only pass calls through, so
+# installing it would be pointless. We test for the symbol instead of a version
+# number: that needs neither pkg-config nor libinput-tools.
+find_libinput() {
+  local f="/usr/$DIR64/libinput.so.10"
+  [ -e "$f" ] || f=$(ldconfig -p 2>/dev/null | awk '/libinput\.so\.10 .*x86-64/ {print $NF; exit}')
+  [ -n "$f" ] && [ -e "$f" ] && readlink -f "$f"
+}
+LIBINPUT=$(find_libinput) || { echo "ERROR: libinput (libinput.so.10) not found. Nothing was installed."; exit 1; }
+LIBINPUT_VER=$(pkg-config --modversion libinput 2>/dev/null || libinput --version 2>/dev/null || echo unknown)
+echo "libinput: $LIBINPUT (version $LIBINPUT_VER)"
+if ! grep -qaF libinput_config_accel_create "$LIBINPUT"; then
+  echo "ERROR: this libinput has no custom acceleration profile (needs >= 1.23)."
+  echo "Examples: Debian 12 ships 1.22, Ubuntu 22.04 ships 1.20. Nothing was installed."
+  exit 1
+fi
+
+# Test-load the 64-bit build via LD_PRELOAD before installing anything. A build
+# against a newer glibc than the system's (e.g. built in a fedora:44 distrobox,
+# installed on Debian 12) fails here with "version `GLIBC_x.y' not found". Through
+# /etc/ld.so.preload, the same error would kill every new process, the login
+# included - and on an update, the preload entry is already active.
+if ! out=$(LD_PRELOAD="$PWD/touchpad-accel.so" /bin/true 2>&1) || [ -n "$out" ]; then
+  echo "ERROR: test load of ./touchpad-accel.so failed:"
+  echo "$out"
+  echo "Rebuild on this system (make clean && make). Nothing was installed."
+  exit 1
+fi
+
 # Write the new file under a temporary name and rename it atomically: running
 # processes (KWin) keep their old copy, newly started ones always find a file.
 put() {
