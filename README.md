@@ -88,7 +88,9 @@ library directory, so 64-bit and 32-bit processes each load the matching build.
 
 ## Installation
 
-Build. You need `gcc`, `make` and 32-bit glibc headers. On Atomic systems (Bazzite,
+Build. You need `gcc`, `make` and a 32-bit toolchain (32-bit glibc headers and link
+libraries). If it is incomplete, `make` stops before the 32-bit build and lists the
+packages to install. On Atomic systems (Bazzite,
 Silverblue, Kinoite), build in a distrobox:
 
 ```bash
@@ -96,7 +98,9 @@ git clone https://github.com/twiebe/libinput-touchpad-acceleration-curve.git
 cd libinput-touchpad-acceleration-curve
 
 distrobox create -i fedora:44 -n build && distrobox enter build   # Atomic systems only
-sudo dnf install -y gcc make glibc-devel glibc-devel.i686           # Debian: gcc-multilib
+sudo dnf install -y gcc make glibc-devel glibc-devel.i686 libgcc.i686 libatomic.i686
+                                       # Debian/Ubuntu: gcc make gcc-multilib
+                                       # Arch: gcc make lib32-glibc lib32-gcc-libs (multilib repo)
 make
 exit                                                                # leave the distrobox
 ```
