@@ -72,6 +72,10 @@ g.libinput_device_config_accel_set_speed.argtypes = [ctypes.c_void_p, ctypes.c_d
 with open("/proc/self/maps") as f:
     preload = any("touchpad-accel" in line for line in f)
 print("Shim loaded:", "yes" if preload else "no (baseline run only)")
+# The click lock hooks libinput's calls into libevdev, so it needs a shared libevdev.
+with open("/proc/self/maps") as f:
+    shared_evdev = any("libevdev" in line for line in f)
+print("Shared libevdev:", "yes" if shared_evdev else "NO - click lock cannot work")
 
 path, name = find_touchpad()
 print(f"Touchpad: {name} ({path})")

@@ -12,22 +12,36 @@
 // Numbers are ALWAYS parsed in the "C" locale (decimal point): KWin runs with
 // the user's locale, and with e.g. LC_NUMERIC=de_DE strtod("0.5") returns 0.
 //
+// Optional click lock (off unless configured): pressing a clickpad rolls the
+// finger, and the finger snaps back on release. libinput only pins a pressed
+// finger for 1.5 mm, so the shim also intercepts libevdev_next_event, which
+// libinput uses to read the touchpad, and holds the reported position still:
+// from the press until the finger moved click_lock_mm, and for release_lock_ms
+// after the release. It then continues with an offset, so the pointer never jumps.
+//
 // Log messages: journalctl -b | grep touchpad-accel
 // No libinput headers needed; the required declarations are below.
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <linux/input.h>
 #include <locale.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
 #include <unistd.h>
 
+#ifndef CONF_PATH // test-hook.py builds with its own path
 #define CONF_PATH "/etc/touchpad-accel.conf"
+#endif
 #define MAX_POINTS 64
+#define MAX_SLOTS 16
+#define MAX_CLICK_LOCK_MM 20.0
+#define MAX_RELEASE_LOCK_MS 1000.0
 
 struct libinput_device;
 struct libinput_config_accel;
@@ -56,6 +70,11 @@ struct curve {
   double step;
   size_t n;
   double points[MAX_POINTS];
+};
+
+struct click_conf {
+  double lock_mm;
+  double release_ms;
 };
 
 // Log to the journal (syslog, independent of KWin's stderr); when running in a
@@ -114,7 +133,16 @@ static int parse_step(char *s, double *step) {
   return *step > 0 ? 0 : -1;
 }
 
-static int load_conf(struct curve *motion, struct curve *scroll) {
+static int parse_limit(char *s, double max, double *out) {
+  char *save;
+  char *tok = strtok_r(s, " \t\r\n", &save);
+  if (!tok || parse_num(tok, out) != 0 || strtok_r(NULL, " \t\r\n", &save))
+    return -1;
+  return *out >= 0 && *out <= max ? 0 : -1;
+}
+
+static int load_conf(struct curve *motion, struct curve *scroll,
+                     struct click_conf *click) {
   FILE *f = fopen(CONF_PATH, "re");
   if (!f) {
     logmsg("cannot read %s (%s) - passing through", CONF_PATH, strerror(errno));
@@ -122,6 +150,7 @@ static int load_conf(struct curve *motion, struct curve *scroll) {
   }
   memset(motion, 0, sizeof *motion);
   memset(scroll, 0, sizeof *scroll);
+  memset(click, 0, sizeof *click);
   char line[2048];
   int lineno = 0, err = 0;
   while (fgets(line, sizeof line, f)) {
@@ -143,6 +172,10 @@ static int load_conf(struct curve *motion, struct curve *scroll) {
       rc = parse_points(rest, motion);
     else if (!strcmp(key, "scroll_points"))
       rc = parse_points(rest, scroll);
+    else if (!strcmp(key, "click_lock_mm"))
+      rc = parse_limit(rest, MAX_CLICK_LOCK_MM, &click->lock_mm);
+    else if (!strcmp(key, "release_lock_ms"))
+      rc = parse_limit(rest, MAX_RELEASE_LOCK_MS, &click->release_ms);
     else
       rc = -1;
     if (rc != 0) {
@@ -158,6 +191,9 @@ static int load_conf(struct curve *motion, struct curve *scroll) {
   }
   return 0;
 }
+
+// Active click lock settings. Written by apply_custom, read by the libevdev hook.
+static _Atomic int click_lock_um, release_lock_us;
 
 static int is_touchpad(struct libinput_device *dev) {
   LOOKUP(finger_count, finger_count_fn,
@@ -185,8 +221,13 @@ static void apply_custom(struct libinput_device *dev) {
     return;
 
   struct curve motion, scroll;
-  if (load_conf(&motion, &scroll) != 0)
+  struct click_conf click;
+  if (load_conf(&motion, &scroll, &click) != 0) {
+    click_lock_um = release_lock_us = 0;
     return;
+  }
+  click_lock_um = (int)(click.lock_mm * 1000);
+  release_lock_us = (int)(click.release_ms * 1000);
 
   const char *name = get_name ? get_name(dev) : "?";
   char stepbuf[32];
@@ -205,8 +246,10 @@ static void apply_custom(struct libinput_device *dev) {
   int rc = ok ? apply(dev, a) : -1;
   in_apply = 0;
   destroy(a);
-  logmsg("%s: custom curve (%zu points, step %s) %s", name, motion.n, stepbuf,
-         rc == 0 ? "applied" : "FAILED");
+  logmsg("%s: custom curve (%zu points, step %s) %s, click lock %d um, "
+         "release lock %d ms",
+         name, motion.n, stepbuf, rc == 0 ? "applied" : "FAILED",
+         (int)click_lock_um, (int)release_lock_us / 1000);
 }
 
 int libinput_device_config_accel_set_speed(struct libinput_device *dev,
@@ -222,5 +265,165 @@ int libinput_device_config_accel_set_profile(struct libinput_device *dev,
   LOOKUP(real, set_profile_fn, "libinput_device_config_accel_set_profile");
   int rc = real ? real(dev, profile) : 1;
   apply_custom(dev);
+  return rc;
+}
+
+// --- Click lock: position filter between libevdev and libinput ---
+
+struct libevdev;
+
+typedef int (*next_event_fn)(struct libevdev *, unsigned int,
+                             struct input_event *);
+typedef int (*has_property_fn)(const struct libevdev *, unsigned int);
+typedef int (*get_int_fn)(const struct libevdev *);
+typedef int (*get_abs_fn)(const struct libevdev *, unsigned int);
+
+struct touch {
+  int active;
+  int locked;           // held until it moved far enough or the release lock ends
+  int64_t release_end;  // event time; 0 = no release so far
+  int raw[2], offset[2], center[2], have[2]; // index 0 = x, 1 = y
+};
+
+// One clickpad at a time. Switching devices resets the state, which at worst
+// means one small pointer jump if two clickpads are touched at the same moment.
+static struct {
+  struct libevdev *dev;
+  int slot;
+  int usable;
+  int resolution[2], min[2], max[2];
+  struct touch touches[MAX_SLOTS];
+} pad;
+
+static void pad_init(struct libevdev *dev) {
+  LOOKUP(current_slot, get_int_fn, "libevdev_get_current_slot");
+  LOOKUP(resolution, get_abs_fn, "libevdev_get_abs_resolution");
+  LOOKUP(minimum, get_abs_fn, "libevdev_get_abs_minimum");
+  LOOKUP(maximum, get_abs_fn, "libevdev_get_abs_maximum");
+  memset(&pad, 0, sizeof pad);
+  pad.dev = dev;
+  if (!current_slot || !resolution || !minimum || !maximum) {
+    logmsg("click lock: libevdev functions missing - passing through");
+    return;
+  }
+  static const unsigned int codes[2] = {ABS_MT_POSITION_X, ABS_MT_POSITION_Y};
+  for (int i = 0; i < 2; i++) {
+    pad.resolution[i] = resolution(dev, codes[i]);
+    pad.min[i] = minimum(dev, codes[i]);
+    pad.max[i] = maximum(dev, codes[i]);
+  }
+  pad.slot = current_slot(dev);
+  pad.usable = pad.resolution[0] > 0 && pad.resolution[1] > 0;
+  logmsg("click lock: reading clickpad events%s",
+         pad.usable ? "" : ", but it has no axis resolution - passing through");
+}
+
+static int64_t event_time_us(const struct input_event *ev) {
+  return (int64_t)ev->input_event_sec * 1000000 + ev->input_event_usec;
+}
+
+// Has the finger moved at least click_lock_um from where it was pressed?
+static int moved_past_lock(const struct touch *t, int lock_um) {
+  // Micrometers per axis; compared as squares to avoid libm (not linked here).
+  int64_t x = (int64_t)(t->raw[0] - t->center[0]) * 1000 / pad.resolution[0];
+  int64_t y = (int64_t)(t->raw[1] - t->center[1]) * 1000 / pad.resolution[1];
+  return x * x + y * y >= (int64_t)lock_um * lock_um;
+}
+
+static int is_held(struct touch *t, int64_t now, int lock_um) {
+  if (t->release_end) {
+    if (now < t->release_end)
+      return 1;
+    t->locked = 0; // the press lock ends with the release lock
+  }
+  if (!t->locked)
+    return 0;
+  if (moved_past_lock(t, lock_um)) {
+    t->locked = 0;
+    return 0;
+  }
+  return 1;
+}
+
+static void filter_position(struct input_event *ev, int axis, int lock_um) {
+  if (pad.slot < 0 || pad.slot >= MAX_SLOTS)
+    return;
+  struct touch *t = &pad.touches[pad.slot];
+  if (!t->active)
+    return;
+  int delta = t->have[axis] ? ev->value - t->raw[axis] : 0;
+  t->raw[axis] = ev->value;
+  t->have[axis] = 1;
+  if (is_held(t, event_time_us(ev), lock_um))
+    t->offset[axis] += delta;
+  int v = ev->value - t->offset[axis];
+  ev->value = v < pad.min[axis] ? pad.min[axis]
+            : v > pad.max[axis] ? pad.max[axis]
+                                : v;
+}
+
+static void filter_button(const struct input_event *ev, int lock_um,
+                          int release_us) {
+  for (int i = 0; i < MAX_SLOTS; i++) {
+    struct touch *t = &pad.touches[i];
+    if (!t->active)
+      continue;
+    if (ev->value == 1) { // pressed; fingers landing later are not locked
+      t->locked = lock_um > 0;
+      t->release_end = 0;
+      t->center[0] = t->raw[0];
+      t->center[1] = t->raw[1];
+    } else if (ev->value == 0) {
+      t->release_end = event_time_us(ev) + release_us;
+    }
+  }
+}
+
+static void filter_event(struct libevdev *dev, struct input_event *ev) {
+  LOOKUP(has_property, has_property_fn, "libevdev_has_property");
+  int lock_um = click_lock_um, release_us = release_lock_us;
+  if ((lock_um == 0 && release_us == 0) || !has_property ||
+      (ev->type != EV_ABS && ev->type != EV_KEY) ||
+      !has_property(dev, INPUT_PROP_BUTTONPAD))
+    return;
+  if (dev != pad.dev)
+    pad_init(dev);
+  if (!pad.usable)
+    return;
+
+  if (ev->type == EV_KEY) {
+    if (ev->code == BTN_LEFT)
+      filter_button(ev, lock_um, release_us);
+    return;
+  }
+  switch (ev->code) {
+  case ABS_MT_SLOT:
+    pad.slot = ev->value;
+    break;
+  case ABS_MT_TRACKING_ID:
+    if (pad.slot >= 0 && pad.slot < MAX_SLOTS) {
+      memset(&pad.touches[pad.slot], 0, sizeof pad.touches[pad.slot]);
+      pad.touches[pad.slot].active = ev->value != -1;
+    }
+    break;
+  case ABS_MT_POSITION_X:
+    filter_position(ev, 0, lock_um);
+    break;
+  case ABS_MT_POSITION_Y:
+    filter_position(ev, 1, lock_um);
+    break;
+  default:
+    break;
+  }
+}
+
+int libevdev_next_event(struct libevdev *dev, unsigned int flags,
+                        struct input_event *ev) {
+  LOOKUP(real, next_event_fn, "libevdev_next_event");
+  if (!real)
+    return -ENOSYS;
+  int rc = real(dev, flags, ev);
+  if (rc == 0 || rc == 1) // LIBEVDEV_READ_STATUS_SUCCESS / _SYNC
+    filter_event(dev, ev);
   return rc;
 }
