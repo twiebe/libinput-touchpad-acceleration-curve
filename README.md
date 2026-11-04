@@ -86,6 +86,29 @@ entry is `/usr/local/$LIB/touchpad-accel.so`. glibc expands `$LIB` per process t
 library directory, so 64-bit and 32-bit processes each load the matching build.
 32-bit programs therefore don't print `wrong ELF class` errors.
 
+### Click lock (optional)
+
+Pressing a clickpad rolls the finger, and the finger snaps back on release, which
+shifts the pointer. libinput pins a pressed finger, but only for 1.5 mm. The click
+lock adds to that. It is off unless you add these lines to `/etc/touchpad-accel.conf`:
+
+```
+click_lock_mm   0.5   # extra travel after a press before the pointer moves
+release_lock_ms 120   # pointer stays still this long after the release
+```
+
+The values come from `libinput record` files of a Framework 13 Pro (37 clicks and
+drags); the snap-back was over after about 130 ms. The costs: drags start 0.5 mm later, and
+motion in the first 120 ms after a release is lost, even if you meant it.
+
+For this, the shim also intercepts `libevdev_next_event`, which libinput uses to read
+the touchpad. It only changes finger positions on clickpads, and it continues with an
+offset after a hold, so the pointer doesn't jump. This code runs on every touchpad
+event inside KWin, so run both tests before your next login.
+
+**Add these lines only after you logged in with the new version.** An older shim
+treats the unknown keys as an invalid config and drops the whole curve.
+
 ## Installation
 
 Build. You need `gcc`, `make` and a 32-bit toolchain (32-bit glibc headers and link
@@ -129,6 +152,7 @@ entry again and stops. It doesn't overwrite an existing `/etc/touchpad-accel.con
 | File | Purpose |
 |---|---|
 | `test-real.py` | Opens the touchpad in a **separate** libinput context (KWin is not affected), makes the same calls as KWin under the user's locale, and checks that the custom profile becomes active. If the test crashes, KWin would have crashed too, but your login stays intact. **Run it after every change to the shim and after every libinput update, before your next login.** |
+| `test-hook.py` | Tests the click lock without a touchpad or root, against a fake libinput/libevdev. Optionally replays `libinput record` files: `python3 -I test-hook.py recording.yml`. |
 | `measure.py` | Records for 15 s how finger speed is translated into pointer motion (table by mm/s, gain, swallowed events) and shows your touchpad's resolution. Useful to compare `adaptive` with your own curve. |
 | `reload.sh` | Makes KWin re-apply the curve without logging in again: nudges the touchpad speed via D-Bus by 0.01 and back. No `sudo` needed. |
 | `uninstall.sh` | Removes the libraries and the preload entry. The config is kept. |
@@ -230,6 +254,9 @@ To disable the curve temporarily without uninstalling:
 - The speed slider in System Settings has no effect while the curve is active. It
   only serves as a trigger to reload (which is what `reload.sh` uses).
 - libinput's custom profile does not smooth the speed across events (see above).
+- The click lock needs a libinput that links libevdev as a shared library
+  (`test-real.py` shows this). The lock can't tell a large roll from a slow drag: a
+  roll beyond `click_lock_mm` still moves the pointer.
 
 [plasma-desktop!3569]: https://invent.kde.org/plasma/plasma-desktop/-/merge_requests/3569
 [Bug 464868]: https://bugs.kde.org/show_bug.cgi?id=464868
