@@ -110,7 +110,9 @@ acceleration (`libinput_device_config_accel_set_speed` / `_set_profile`). After 
 for a **touchpad** (a device with tap support), the shim applies the curve from
 `/etc/touchpad-accel.conf`, including its [device sections](#several-touchpads). Other
 devices such as mice are left alone. If the config file is missing or invalid, the shim
-just passes calls through and logs the reason to the journal.
+just passes calls through and logs the reason to the journal. If it had switched the
+touchpad to the custom profile before, it switches it back to the profile the
+compositor asked for.
 
 Why `/etc/ld.so.preload` instead of `LD_PRELOAD` for the compositor only? The
 compositor is started by the login manager and the session, so there is no single,
@@ -188,7 +190,7 @@ entry again and stops. It doesn't overwrite an existing `/etc/touchpad-accel.con
 | File | Purpose |
 |---|---|
 | `test-real.py` | Opens the touchpad in a **separate** libinput context (the compositor is not affected), makes the same calls as a compositor under the user's locale, and checks that the custom profile becomes active. If the test crashes, the compositor would have crashed too, but your login stays intact. **Run it after every change to the shim and after every libinput update, before your next login.** It finds devices with "touchpad" in their name; for others, pass the path: `sudo python3 -I test-real.py /dev/input/event19`. |
-| `test-hook.py` | Tests the click lock and device sections without a touchpad or root, against a fake libinput/libevdev. Optionally replays `libinput record` files: `python3 -I test-hook.py recording.yml`. |
+| `test-hook.py` | Tests the click lock, device sections and restoring the profile without a touchpad or root, against a fake libinput/libevdev. Optionally replays `libinput record` files: `python3 -I test-hook.py recording.yml`. |
 | `measure.py` | Records for 15 s how finger speed is translated into pointer motion (table by mm/s, gain, swallowed events) and shows your touchpad's resolution. Useful to compare `adaptive` with your own curve. For a device without "touchpad" in its name: `sudo python3 -I measure.py 15 /dev/input/event19`. |
 | `reload.sh` | Makes the compositor re-apply the curve without logging in again: nudges the touchpad speed by 0.01 and back. Knows GNOME and KWin: on GNOME via `gsettings` (one speed for all touchpads); on KWin via D-Bus, for every device with "touchpad" or "trackpad" in its name. Run it without `sudo`. |
 | `uninstall.sh` | Removes the libraries and the preload entry. The config is kept. |
@@ -304,8 +306,12 @@ On rpm-ostree/bootc systems, booting the previous deployment only helps as long 
 system update has been installed since you installed the shim. After that, the
 previous deployment contains the preload entry as well.
 
-To disable the curve temporarily without uninstalling:
-`sudo mv /etc/touchpad-accel.conf{,.off} && ./reload.sh`
+To disable the curve and the click lock temporarily without uninstalling:
+`sudo mv /etc/touchpad-accel.conf{,.off} && ./reload.sh`. Without a usable config,
+the shim gives the touchpad back the profile the compositor asked for (the journal
+says `profile 2 restored` for `adaptive`). Shims from before this change can't do
+that: until the next login, the curve stays active. Move the config back and run
+`./reload.sh` again to re-enable it.
 
 ## Pitfalls found during development
 

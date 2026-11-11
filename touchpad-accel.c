@@ -20,6 +20,10 @@
 // from the press until the finger moved click_lock_mm, and for release_lock_ms
 // after the release. It then continues with an offset, so the pointer never jumps.
 //
+// Without a usable config, a touchpad the shim switched to the custom profile gets
+// the profile back that the compositor last asked for (or libinput's default), so
+// renaming the config and reloading really disables the curve.
+//
 // Touchpads differ: the curve is evaluated in raw device units, so a touchpad with
 // twice the resolution moves the pointer more than twice as far. [device "..."]
 // sections in the config override settings for devices whose name contains the text.
@@ -47,6 +51,7 @@
 #define MAX_SLOTS 16
 #define MAX_CLICK_LOCK_MM 20.0
 #define MAX_RELEASE_LOCK_MS 1000.0
+#define MAX_DEVICES 16
 
 struct libinput_device;
 struct libinput_config_accel;
@@ -57,6 +62,8 @@ enum { ACCEL_TYPE_FALLBACK = 0, ACCEL_TYPE_MOTION = 1, ACCEL_TYPE_SCROLL = 2 };
 
 typedef int (*set_speed_fn)(struct libinput_device *, double);
 typedef int (*set_profile_fn)(struct libinput_device *, int);
+typedef int (*get_profile_fn)(struct libinput_device *);
+typedef double (*get_speed_fn)(struct libinput_device *);
 typedef int (*finger_count_fn)(struct libinput_device *);
 typedef const char *(*get_name_fn)(struct libinput_device *);
 typedef struct libinput_config_accel *(*accel_create_fn)(int);
@@ -251,6 +258,52 @@ static int is_touchpad(struct libinput_device *dev) {
 // again. Without the guard -> infinite recursion -> stack overflow (SEGV).
 static __thread int in_apply;
 
+// The profile the compositor last asked for, per touchpad. libinput calls happen
+// on the compositor's input thread only, so a small table without locking does.
+// A full table reuses the oldest slot; a device without an entry gets libinput's
+// default profile back.
+static struct {
+  struct libinput_device *dev;
+  int profile;
+} requested[MAX_DEVICES];
+static unsigned int requested_next;
+
+static void remember_profile(struct libinput_device *dev, int profile) {
+  for (int i = 0; i < MAX_DEVICES; i++)
+    if (requested[i].dev == dev) {
+      requested[i].profile = profile;
+      return;
+    }
+  requested[requested_next % MAX_DEVICES].dev = dev;
+  requested[requested_next % MAX_DEVICES].profile = profile;
+  requested_next++;
+}
+
+// Undoes the custom profile when there is no curve to apply.
+static void restore_profile(struct libinput_device *dev, const char *name) {
+  LOOKUP(get_profile, get_profile_fn, "libinput_device_config_accel_get_profile");
+  LOOKUP(get_default, get_profile_fn,
+         "libinput_device_config_accel_get_default_profile");
+  LOOKUP(get_speed, get_speed_fn, "libinput_device_config_accel_get_speed");
+  LOOKUP(set_profile, set_profile_fn, "libinput_device_config_accel_set_profile");
+  LOOKUP(set_speed, set_speed_fn, "libinput_device_config_accel_set_speed");
+  if (!get_profile || !set_profile || get_profile(dev) != PROFILE_CUSTOM)
+    return;
+  int profile = get_default ? get_default(dev) : 0;
+  for (int i = 0; i < MAX_DEVICES; i++)
+    if (requested[i].dev == dev)
+      profile = requested[i].profile;
+  if (profile == PROFILE_CUSTOM || profile == 0)
+    return; // the compositor wants custom itself, or nothing to go back to
+  // set_profile and set_speed are the real libinput functions (RTLD_NEXT), not
+  // our hooks. The speed was kept while custom was active; apply it again.
+  int rc = set_profile(dev, profile);
+  if (rc == 0 && get_speed && set_speed)
+    set_speed(dev, get_speed(dev));
+  logmsg("%s: no curve, profile %d %s", name, profile,
+         rc == 0 ? "restored" : "NOT restored");
+}
+
 static void apply_custom(struct libinput_device *dev) {
   if (in_apply)
     return;
@@ -270,8 +323,10 @@ static void apply_custom(struct libinput_device *dev) {
   const char *name = get_name ? get_name(dev) : "?";
   struct curve motion, scroll;
   struct click_conf click;
-  if (load_conf(name, &motion, &scroll, &click) != 0)
+  if (load_conf(name, &motion, &scroll, &click) != 0) {
+    restore_profile(dev, name);
     return;
+  }
 
   char stepbuf[32];
   locale_t old = uselocale(c_locale());
@@ -307,6 +362,8 @@ int libinput_device_config_accel_set_profile(struct libinput_device *dev,
                                              int profile) {
   LOOKUP(real, set_profile_fn, "libinput_device_config_accel_set_profile");
   int rc = real ? real(dev, profile) : 1;
+  if (!in_apply && is_touchpad(dev))
+    remember_profile(dev, profile);
   apply_custom(dev);
   return rc;
 }

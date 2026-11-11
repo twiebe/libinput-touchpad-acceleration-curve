@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Tests the click lock and device sections in the compiled shim, without a touchpad or root.
+"""Tests the click lock, device sections and profile restore in the compiled shim,
+without a touchpad or root.
 
 Builds the shim with a private config path and loads it in front of a fake
 libinput/libevdev, then feeds events through the shim's libevdev_next_event.
@@ -35,12 +36,15 @@ static struct input_event queued; static int queued_rc, clickpad = 1;
 static char name[128] = "fake";
 static double steps[3], first[3];
 static size_t counts[3];
-static int applied;
+static int applied, profile = 2, set_profile_calls;
 void fake_queue(struct input_event e, int rc) { queued = e; queued_rc = rc; }
 void fake_clickpad(int v) { clickpad = v; }
 void fake_name(const char *n) { snprintf(name, sizeof name, "%%s", n); }
+void fake_profile(int p) { profile = p; }
+int fake_get_profile(void) { return profile; }
+int fake_set_profile_calls(void) { return set_profile_calls; }
 void fake_reset(void) {
-  applied = 0;
+  applied = 0; set_profile_calls = 0;
   for (int i = 0; i < 3; i++) { steps[i] = first[i] = 0; counts[i] = 0; } }
 int fake_applied(void) { return applied; }
 double fake_step(int t) { return steps[t]; }
@@ -61,7 +65,13 @@ int libevdev_get_abs_maximum(const struct libevdev *d, unsigned c) {
 int libinput_device_config_accel_set_speed(struct libinput_device *d, double s) {
   (void)d; (void)s; return 0; }
 int libinput_device_config_accel_set_profile(struct libinput_device *d, int p) {
-  (void)d; (void)p; return 0; }
+  (void)d; profile = p; set_profile_calls++; return 0; }
+int libinput_device_config_accel_get_profile(struct libinput_device *d) {
+  (void)d; return profile; }
+int libinput_device_config_accel_get_default_profile(struct libinput_device *d) {
+  (void)d; return 2; }
+double libinput_device_config_accel_get_speed(struct libinput_device *d) {
+  (void)d; return 0.4; }
 int libinput_device_config_tap_get_finger_count(struct libinput_device *d) {
   (void)d; return 1; }
 const char *libinput_device_get_name(struct libinput_device *d) {
@@ -73,7 +83,7 @@ int libinput_config_accel_set_points(struct libinput_config_accel *a, int t,
     double s, size_t n, double *v) {
   (void)a; steps[t] = s; counts[t] = n; first[t] = v[1]; return 0; }
 int libinput_device_config_accel_apply(struct libinput_device *d,
-    struct libinput_config_accel *a) { (void)d; (void)a; applied++; return 0; }
+    struct libinput_config_accel *a) { (void)d; (void)a; applied++; profile = 4; return 0; }
 """ % {"res": RES, "max_x": MAX_X, "max_y": MAX_Y}
 
 
@@ -90,6 +100,7 @@ class Pad:
         self.next_event.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(Event)]
         self.set_speed = shim.libinput_device_config_accel_set_speed
         self.set_speed.argtypes = [ctypes.c_void_p, ctypes.c_double]
+        self.shim = shim
         self.fake = fake
         self.fake.fake_queue.argtypes = [Event, ctypes.c_int]
         self.fake.fake_name.argtypes = [ctypes.c_char_p]
@@ -100,9 +111,12 @@ class Pad:
         self.dev = 0x1000
         self.ms = 1000.0
 
-    def configure(self, conf):
+    def write_conf(self, conf):
         with open(self.conf_path, "w") as f:
             f.write(conf)
+
+    def configure(self, conf):
+        self.write_conf(conf)
         self.dev += 16  # a new device resets the shim's touch state
         self.set_speed(1, 0.0)
 
@@ -297,6 +311,45 @@ def run_sections(p, check):
     p.configure(CONF_ON)
 
 
+def run_restore(p, check):
+    FLAT, ADAPTIVE, CUSTOM = 1, 2, 4
+    set_profile = p.shim.libinput_device_config_accel_set_profile
+    set_profile.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    p.fake.fake_name(b"PIXA3854:00 093A:0274 Touchpad")
+
+    p.fake.fake_reset()
+    p.write_conf(CONF_OFF)
+    set_profile(1, FLAT)  # the compositor asks for flat, the shim makes it custom
+    check("restore: curve applied", p.fake.fake_get_profile() == CUSTOM)
+
+    p.fake.fake_reset()
+    os.remove(p.conf_path)
+    p.set_speed(1, 0.0)  # reload.sh: only the speed changes
+    check("restore: config missing -> requested profile back",
+          p.fake.fake_get_profile() == FLAT and not p.fake.fake_applied())
+
+    p.fake.fake_reset()
+    p.set_speed(1, 0.0)
+    check("restore: not custom -> profile left alone",
+          p.fake.fake_get_profile() == FLAT and p.fake.fake_set_profile_calls() == 0)
+
+    p.write_conf(CONF_OFF)
+    p.set_speed(1, 0.0)
+    check("restore: config back -> curve again", p.fake.fake_get_profile() == CUSTOM)
+
+    p.write_conf("motion_step 1\nmotion_points 0 x\n")
+    p.set_speed(1, 0.0)
+    check("restore: invalid config -> requested profile back", p.fake.fake_get_profile() == FLAT)
+
+    p.write_conf(CONF_OFF)
+    p.set_speed(3, 0.0)  # another device, no profile requested for it
+    os.remove(p.conf_path)
+    p.set_speed(3, 0.0)
+    check("restore: nothing requested -> libinput default",
+          p.fake.fake_get_profile() == ADAPTIVE)
+    p.write_conf(CONF_ON)
+
+
 def load_recording(path):
     line = re.compile(r"-\s*\[\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(-?\d+)\]")
     with open(path) as f:
@@ -372,6 +425,7 @@ def child(paths):
 
     run_synthetic(p, check)
     run_sections(p, check)
+    run_restore(p, check)
     for path in paths:
         check_recording(p, path, check)
     print(f"\nRESULT: {'FAILED: ' + str(len(failures)) if failures else 'all passed'}")
