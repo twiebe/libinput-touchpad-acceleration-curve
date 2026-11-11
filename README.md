@@ -23,6 +23,20 @@ to measure how your touchpad actually behaves.
 - **Your compositor already exposes libinput's custom profile** (e.g. Hyprland's
   `accel_profile = custom`): use that instead. The shim would work there too, but
   the built-in setting needs no hack.
+- **GNOME 51 or newer:** try the built-in setting first ([mutter!4296]). It takes
+  the same values in the same units as `touchpad-accel.conf` (untested so far):
+
+  ```bash
+  gsettings set org.gnome.desktop.peripherals.touchpad custom-accel-config \
+    "{'pointer-step': <@d 0.25>, 'pointer-speeds': <@ad [0, 0.12, 0.25, 0.495, 0.84, 1.25, 1.575, 1.969, 2.4, 2.925, 3.5, 4.125, 4.8, 5.525, 6.3, 7.125, 8, 8.819, 9.675, 10.569, 11.5, 12.337, 13.2, 14.088, 15]>}"
+  gsettings set org.gnome.desktop.peripherals.touchpad accel-profile custom
+  ```
+
+  The shim is still useful there if you need what GNOME doesn't offer (yet): a
+  different curve per touchpad ([device sections](#several-touchpads)), the
+  [click lock](#click-lock-optional), or a scroll curve. As of GNOME 51, Mutter
+  sets only the pointer curve, so scrolling and gestures run flat in raw device
+  units ([mutter!5390]). Don't use both at once: the shim overrides the setting.
 - **An X11 session:** not needed. The Xorg libinput driver exposes the custom profile
   through `xinput` (properties `libinput Accel Custom Motion Points/Step`).
 - **KDE adds it natively:** work on a curve editor is ongoing
@@ -189,6 +203,12 @@ motion_points 0 0.1 0.25 ...          # y values at x = 0, step, 2*step, ...
 #scroll_step / scroll_points           # optional separate curve for scrolling
 ```
 
+Without a scroll curve, libinput does **not** keep its usual scroll speed: with the
+custom profile, a movement type without a curve of its own falls back to flat 1:1
+in raw device units. That can make scrolling too fast, the more so the higher the
+touchpad's resolution. The commented-out example in `touchpad-accel.conf` is exactly
+this 1:1 curve. Uncomment it and lower the points to scroll slower.
+
 - **x** = finger speed, **y** = pointer speed. libinput interpolates linearly
   between points and extrapolates past the last point using the last slope.
 - **Units:** for touchpads, libinput evaluates the custom curve in **raw touchpad
@@ -210,7 +230,8 @@ All of them are identical in the mid and upper range (gain ~1.0 at 50 mm/s, ~1.5
 
 | File | Gain for slow movement (< ~15 mm/s) |
 |---|---|
-| `touchpad-accel.conf` (default) | 0.4 |
+| `touchpad-accel.conf` (default) | 0.48, reaching 0.5 at ~20 mm/s |
+| `examples/gain-0.4.conf` | 0.4 |
 | `examples/gain-0.5.conf` | 0.5 |
 | `examples/gain-0.62.conf` | 0.62 |
 
@@ -308,12 +329,17 @@ To disable the curve temporarily without uninstalling:
   Plasma System Settings) has no effect while the curve is active. It only serves as a trigger to reload (which is what
   `reload.sh` uses). The acceleration profile setting is overridden as well.
 - libinput's custom profile does not smooth the speed across events (see above).
+- Without a scroll curve, scrolling runs flat 1:1 in raw device units (see
+  [Format](#format)). Pinch gestures always do: the shim sets no curve for libinput's
+  fallback movement type.
 - The click lock needs a libinput that links libevdev as a shared library
   (`test-real.py` shows this). The lock can't tell a large roll from a slow drag: a
   roll beyond `click_lock_mm` still moves the pointer.
 
 [plasma-desktop!3569]: https://invent.kde.org/plasma/plasma-desktop/-/merge_requests/3569
 [Bug 464868]: https://bugs.kde.org/show_bug.cgi?id=464868
+[mutter!4296]: https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/4296
+[mutter!5390]: https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/5390
 
 ## References
 
@@ -322,7 +348,8 @@ To disable the curve temporarily without uninstalling:
 - libinput 1.31.3: `src/libinput.c` (`libinput_device_config_accel_apply`),
   `src/filter-custom.c`, `src/evdev-mt-touchpad.c` (`tp_filter_motion`)
 - KWin 6.7.5: `src/backends/libinput/device.cpp` (`Device::setPointerAcceleration`)
-- Mutter: `src/backends/native/meta-input-settings-native.c` (`set_speed`, `set_accel_profile`)
+- Mutter: `src/backends/native/meta-input-settings-native.c`
+- libinput 1.32.0: `doc/user/pointer-acceleration.rst` (custom profile, movement types and fallback)
 
 ## License
 
