@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Measures on the real touchpad how finger speed is translated into pointer motion.
 
-Opens the touchpad in a separate libinput context (KWin is not affected), sets the
-profile the way KWin does, and records movement for a few seconds.
+Opens the touchpad in a separate libinput context (the compositor is not affected), sets
+the profile the way a compositor does, and records movement for a few seconds.
 
 If the shim is installed via /etc/ld.so.preload, it is active here as well. Then:
   Custom curve:      sudo python3 -I measure.py [seconds]
@@ -12,6 +12,8 @@ If the shim is installed via /etc/ld.so.preload, it is active here as well. Then
       sudo python3 -I measure.py
       sudo mv /etc/touchpad-accel.conf.off /etc/touchpad-accel.conf
 Shim not installed: sudo env LD_PRELOAD=$PWD/touchpad-accel.so python3 -I measure.py
+Another device than the first touchpad, e.g. an external one:
+  sudo python3 -I measure.py 15 /dev/input/event19
 
 During the measurement: first move very slowly/precisely for a few seconds,
 then at normal speed, then a few fast swipes.
@@ -34,6 +36,10 @@ BINS = [0, 5, 10, 20, 40, 80, 160, 320, 640, math.inf]
 
 
 def find_touchpad():
+    if len(sys.argv) > 2:
+        path = sys.argv[2]
+        with open(f"/sys/class/input/{os.path.basename(path)}/device/name") as f:
+            return path, f.read().strip()
     for name_file in sorted(glob.glob("/sys/class/input/event*/device/name")):
         with open(name_file) as f:
             name = f.read().strip()
@@ -125,7 +131,7 @@ def main():
     dev = g.libinput_path_add_device(li, path.encode()) if li else None
     if not dev:
         sys.exit("Could not open device (did you run with sudo?)")
-    g.libinput_device_config_accel_set_profile(dev, 2)  # like KWin
+    g.libinput_device_config_accel_set_profile(dev, 2)  # like a compositor (adaptive)
     g.libinput_device_config_accel_set_speed(dev, 0.4)  # only relevant for adaptive
     prof = g.libinput_device_config_accel_get_profile(dev)
     print(f"Profile: {PROFILES.get(prof, prof)}  (speed 0.4, only relevant for adaptive)")

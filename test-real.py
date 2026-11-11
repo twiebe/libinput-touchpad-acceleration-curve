@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Tests the shim against the system's REAL libinput without risking KWin/login.
+"""Tests the shim against the system's REAL libinput without risking the compositor
+or the login.
 
-Opens the touchpad in a separate, private libinput context (does not disturb KWin),
-calls set_profile/set_speed the way KWin does, and checks whether the custom profile
-is active afterwards. A crash here means KWin would have crashed too.
+Opens the touchpad in a separate, private libinput context (does not disturb the
+compositor), calls set_profile/set_speed the way a compositor does, and checks
+whether the custom profile is active afterwards. A crash here means the compositor
+would have crashed too.
 
 Usage (shim installed via /etc/ld.so.preload):
   sudo python3 -I test-real.py
 Shim not installed yet (run in the directory containing the .so files):
   sudo env LD_PRELOAD=$PWD/touchpad-accel.so python3 -I test-real.py
+Another device than the first touchpad, e.g. an external one:
+  sudo python3 -I test-real.py /dev/input/event19
 """
 import ctypes
 import glob
@@ -17,7 +21,7 @@ import locale
 import os
 import sys
 
-# Like KWin/Qt: adopt the user's locale (e.g. de_DE uses a decimal comma).
+# Like the compositor: adopt the user's locale (e.g. de_DE uses a decimal comma).
 # This also verifies that the shim parses numbers independently of it.
 print("Locale:", locale.setlocale(locale.LC_ALL, ""))
 
@@ -25,6 +29,10 @@ PROFILES = {0: "none", 1: "flat", 2: "adaptive", 4: "custom"}
 
 
 def find_touchpad():
+    if len(sys.argv) > 1:
+        path = sys.argv[1]
+        with open(f"/sys/class/input/{os.path.basename(path)}/device/name") as f:
+            return path, f.read().strip()
     for name_file in sorted(glob.glob("/sys/class/input/event*/device/name")):
         with open(name_file) as f:
             name = f.read().strip()
@@ -33,7 +41,7 @@ def find_touchpad():
     sys.exit("No touchpad found")
 
 
-# Resolve functions through the global namespace (the way KWin calls them),
+# Resolve functions through the global namespace (the way the compositor calls them),
 # so the preloaded shim takes effect.
 ctypes.CDLL("libinput.so.10", mode=ctypes.RTLD_GLOBAL)
 g = ctypes.CDLL(None)
@@ -90,9 +98,9 @@ if not dev:
 
 prof = g.libinput_device_config_accel_get_profile
 print("Profile before:     ", PROFILES.get(prof(dev), prof(dev)))
-rc1 = g.libinput_device_config_accel_set_profile(dev, 2)  # like KWin: adaptive
+rc1 = g.libinput_device_config_accel_set_profile(dev, 2)  # like a compositor: adaptive
 print(f"set_profile(adaptive) -> rc={rc1}, profile now: {PROFILES.get(prof(dev), prof(dev))}")
-rc2 = g.libinput_device_config_accel_set_speed(dev, 0.4)  # like KWin
+rc2 = g.libinput_device_config_accel_set_speed(dev, 0.4)  # like a compositor
 final = prof(dev)
 print(f"set_speed(0.4)        -> rc={rc2}, profile now: {PROFILES.get(final, final)}")
 g.libinput_unref(li)

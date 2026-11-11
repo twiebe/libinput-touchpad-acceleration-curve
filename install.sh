@@ -68,7 +68,7 @@ if ! out=$(LD_PRELOAD="$PWD/touchpad-accel.so" /bin/true 2>&1) || [ -n "$out" ];
 fi
 
 # Write the new file under a temporary name and rename it atomically: running
-# processes (KWin) keep their old copy, newly started ones always find a file.
+# processes (the compositor) keep their old copy, newly started ones always find a file.
 put() {
   install -Dm755 "$1" "$2.new"
   mv -f "$2.new" "$2"

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: MIT
 //
 // touchpad-accel: forces a libinput custom acceleration curve onto touchpads,
-// even if the compositor (KWin) does not offer the custom profile.
+// even if the compositor (GNOME, KDE Plasma, ...) does not offer the custom
+// profile.
 //
 // How it works: the library is loaded via /etc/ld.so.preload and intercepts
-// libinput_device_config_accel_set_speed / _set_profile. Whenever KWin calls
-// these for a touchpad (at startup, on hotplug, when the speed slider changes),
+// libinput_device_config_accel_set_speed / _set_profile. Whenever the compositor
+// calls these for a touchpad (at startup, on hotplug, when the speed slider changes),
 // the curve from CONF_PATH is applied afterwards. If the file is missing or
 // invalid, calls are only passed through (the reason is logged to the journal).
 //
-// Numbers are ALWAYS parsed in the "C" locale (decimal point): KWin runs with
+// Numbers are ALWAYS parsed in the "C" locale (decimal point): the compositor runs with
 // the user's locale, and with e.g. LC_NUMERIC=de_DE strtod("0.5") returns 0.
 //
 // Optional click lock (off unless configured): pressing a clickpad rolls the
@@ -18,6 +19,10 @@
 // libinput uses to read the touchpad, and holds the reported position still:
 // from the press until the finger moved click_lock_mm, and for release_lock_ms
 // after the release. It then continues with an offset, so the pointer never jumps.
+//
+// Touchpads differ: the curve is evaluated in raw device units, so a touchpad with
+// twice the resolution moves the pointer more than twice as far. [device "..."]
+// sections in the config override settings for devices whose name contains the text.
 //
 // Log messages: journalctl -b | grep touchpad-accel
 // No libinput headers needed; the required declarations are below.
@@ -77,7 +82,7 @@ struct click_conf {
   double release_ms;
 };
 
-// Log to the journal (syslog, independent of KWin's stderr); when running in a
+// Log to the journal (syslog, independent of the compositor's stderr); when running in a
 // terminal, also print to stderr.
 static void logmsg(const char *fmt, ...) {
   char buf[512];
@@ -112,6 +117,8 @@ static int parse_num(const char *tok, double *out) {
 //   motion_points 0 0.6 1.5 ...
 //   scroll_step   1.0            (optional)
 //   scroll_points 0 1 2 ...      (optional)
+//   [device "text"]              (optional) the following lines, up to the next
+//                                section, only apply if the device name contains text
 static int parse_points(char *s, struct curve *c) {
   c->n = 0;
   char *save;
@@ -141,7 +148,25 @@ static int parse_limit(char *s, double max, double *out) {
   return *out >= 0 && *out <= max ? 0 : -1;
 }
 
-static int load_conf(struct curve *motion, struct curve *scroll,
+// Parses [device "text"] with an optional trailing comment and returns text, or
+// NULL if malformed. Runs before comments are stripped: text may contain a '#'.
+static const char *parse_section(char *s) {
+  static const char prefix[] = "[device \"";
+  if (strncmp(s, prefix, sizeof prefix - 1) != 0)
+    return NULL;
+  char *text = s + sizeof prefix - 1;
+  char *end = strchr(text, '"');
+  if (!end || end == text || end[1] != ']')
+    return NULL;
+  *end = '\0';
+  s = end + 2;
+  s += strspn(s, " \t\r\n");
+  return *s == '\0' || *s == '#' ? text : NULL;
+}
+
+// Loads the settings for the device called name. Sections for other devices are
+// parsed as well, so a typo invalidates the config no matter which device reads it.
+static int load_conf(const char *name, struct curve *motion, struct curve *scroll,
                      struct click_conf *click) {
   FILE *f = fopen(CONF_PATH, "re");
   if (!f) {
@@ -151,10 +176,28 @@ static int load_conf(struct curve *motion, struct curve *scroll,
   memset(motion, 0, sizeof *motion);
   memset(scroll, 0, sizeof *scroll);
   memset(click, 0, sizeof *click);
+  struct curve other_motion = {0}, other_scroll = {0};
+  struct click_conf other_click = {0};
+  struct curve *m = motion, *s = scroll; // where the current section's values go
+  struct click_conf *c = click;
   char line[2048];
   int lineno = 0, err = 0;
   while (fgets(line, sizeof line, f)) {
     lineno++;
+    char *start = line + strspn(line, " \t\r\n");
+    if (*start == '[') {
+      const char *text = parse_section(start);
+      if (!text) {
+        logmsg("%s line %d invalid (expected [device \"name\"])", CONF_PATH, lineno);
+        err = 1;
+        continue;
+      }
+      int match = strstr(name, text) != NULL;
+      m = match ? motion : &other_motion;
+      s = match ? scroll : &other_scroll;
+      c = match ? click : &other_click;
+      continue;
+    }
     char *hash = strchr(line, '#');
     if (hash)
       *hash = '\0';
@@ -165,17 +208,17 @@ static int load_conf(struct curve *motion, struct curve *scroll,
     char *rest = line + off;
     int rc;
     if (!strcmp(key, "motion_step"))
-      rc = parse_step(rest, &motion->step);
+      rc = parse_step(rest, &m->step);
     else if (!strcmp(key, "scroll_step"))
-      rc = parse_step(rest, &scroll->step);
+      rc = parse_step(rest, &s->step);
     else if (!strcmp(key, "motion_points"))
-      rc = parse_points(rest, motion);
+      rc = parse_points(rest, m);
     else if (!strcmp(key, "scroll_points"))
-      rc = parse_points(rest, scroll);
+      rc = parse_points(rest, s);
     else if (!strcmp(key, "click_lock_mm"))
-      rc = parse_limit(rest, MAX_CLICK_LOCK_MM, &click->lock_mm);
+      rc = parse_limit(rest, MAX_CLICK_LOCK_MM, &c->lock_mm);
     else if (!strcmp(key, "release_lock_ms"))
-      rc = parse_limit(rest, MAX_RELEASE_LOCK_MS, &click->release_ms);
+      rc = parse_limit(rest, MAX_RELEASE_LOCK_MS, &c->release_ms);
     else
       rc = -1;
     if (rc != 0) {
@@ -192,8 +235,10 @@ static int load_conf(struct curve *motion, struct curve *scroll,
   return 0;
 }
 
-// Active click lock settings. Written by apply_custom, read by the libevdev hook.
-static _Atomic int click_lock_um, release_lock_us;
+// Bumped whenever a touchpad is configured, which tells the libevdev hook (possibly
+// on another thread) to reload its settings. 0 = no touchpad configured here yet, so
+// the hook stays off in programs that never set an acceleration.
+static _Atomic int conf_generation;
 
 static int is_touchpad(struct libinput_device *dev) {
   LOOKUP(finger_count, finger_count_fn,
@@ -220,16 +265,14 @@ static void apply_custom(struct libinput_device *dev) {
   if (!is_touchpad(dev))
     return;
 
-  struct curve motion, scroll;
-  struct click_conf click;
-  if (load_conf(&motion, &scroll, &click) != 0) {
-    click_lock_um = release_lock_us = 0;
-    return;
-  }
-  click_lock_um = (int)(click.lock_mm * 1000);
-  release_lock_us = (int)(click.release_ms * 1000);
+  conf_generation++;
 
   const char *name = get_name ? get_name(dev) : "?";
+  struct curve motion, scroll;
+  struct click_conf click;
+  if (load_conf(name, &motion, &scroll, &click) != 0)
+    return;
+
   char stepbuf[32];
   locale_t old = uselocale(c_locale());
   snprintf(stepbuf, sizeof stepbuf, "%g", motion.step);
@@ -249,7 +292,7 @@ static void apply_custom(struct libinput_device *dev) {
   logmsg("%s: custom curve (%zu points, step %s) %s, click lock %d um, "
          "release lock %d ms",
          name, motion.n, stepbuf, rc == 0 ? "applied" : "FAILED",
-         (int)click_lock_um, (int)release_lock_us / 1000);
+         (int)(click.lock_mm * 1000), (int)click.release_ms);
 }
 
 int libinput_device_config_accel_set_speed(struct libinput_device *dev,
@@ -277,6 +320,7 @@ typedef int (*next_event_fn)(struct libevdev *, unsigned int,
 typedef int (*has_property_fn)(const struct libevdev *, unsigned int);
 typedef int (*get_int_fn)(const struct libevdev *);
 typedef int (*get_abs_fn)(const struct libevdev *, unsigned int);
+typedef const char *(*evdev_name_fn)(const struct libevdev *);
 
 struct touch {
   int active;
@@ -285,10 +329,13 @@ struct touch {
   int raw[2], offset[2], center[2], have[2]; // index 0 = x, 1 = y
 };
 
-// One clickpad at a time. Switching devices resets the state, which at worst
-// means one small pointer jump if two clickpads are touched at the same moment.
+// One clickpad at a time. Switching devices resets the state and rereads the config,
+// which at worst means one small pointer jump if two clickpads are touched at the
+// same moment.
 static struct {
   struct libevdev *dev;
+  int generation; // conf_generation these settings were loaded for
+  int lock_um, release_us;
   int slot;
   int usable;
   int resolution[2], min[2], max[2];
@@ -297,25 +344,41 @@ static struct {
 
 static void pad_init(struct libevdev *dev) {
   LOOKUP(current_slot, get_int_fn, "libevdev_get_current_slot");
+  memset(&pad, 0, sizeof pad);
+  pad.dev = dev;
+  pad.slot = current_slot ? current_slot(dev) : 0;
+}
+
+// Settings of this device. Keeps the touches: a reload must not disturb a held finger.
+static void pad_load(struct libevdev *dev, int generation) {
+  LOOKUP(get_name, evdev_name_fn, "libevdev_get_name");
   LOOKUP(resolution, get_abs_fn, "libevdev_get_abs_resolution");
   LOOKUP(minimum, get_abs_fn, "libevdev_get_abs_minimum");
   LOOKUP(maximum, get_abs_fn, "libevdev_get_abs_maximum");
-  memset(&pad, 0, sizeof pad);
-  pad.dev = dev;
-  if (!current_slot || !resolution || !minimum || !maximum) {
-    logmsg("click lock: libevdev functions missing - passing through");
+  pad.generation = generation;
+  pad.lock_um = pad.release_us = 0;
+  pad.usable = 0;
+
+  struct curve motion, scroll;
+  struct click_conf click;
+  const char *name = get_name ? get_name(dev) : NULL;
+  if (!name || load_conf(name, &motion, &scroll, &click) != 0 ||
+      (click.lock_mm <= 0 && click.release_ms <= 0))
     return;
+  pad.lock_um = (int)(click.lock_mm * 1000);
+  pad.release_us = (int)(click.release_ms * 1000);
+
+  if (resolution && minimum && maximum) {
+    static const unsigned int codes[2] = {ABS_MT_POSITION_X, ABS_MT_POSITION_Y};
+    for (int i = 0; i < 2; i++) {
+      pad.resolution[i] = resolution(dev, codes[i]);
+      pad.min[i] = minimum(dev, codes[i]);
+      pad.max[i] = maximum(dev, codes[i]);
+    }
+    pad.usable = pad.resolution[0] > 0 && pad.resolution[1] > 0;
   }
-  static const unsigned int codes[2] = {ABS_MT_POSITION_X, ABS_MT_POSITION_Y};
-  for (int i = 0; i < 2; i++) {
-    pad.resolution[i] = resolution(dev, codes[i]);
-    pad.min[i] = minimum(dev, codes[i]);
-    pad.max[i] = maximum(dev, codes[i]);
-  }
-  pad.slot = current_slot(dev);
-  pad.usable = pad.resolution[0] > 0 && pad.resolution[1] > 0;
-  logmsg("click lock: reading clickpad events%s",
-         pad.usable ? "" : ", but it has no axis resolution - passing through");
+  logmsg("click lock: reading events of %s%s", name,
+         pad.usable ? "" : ", but its axis resolution is unknown - passing through");
 }
 
 static int64_t event_time_us(const struct input_event *ev) {
@@ -381,15 +444,18 @@ static void filter_button(const struct input_event *ev, int lock_um,
 
 static void filter_event(struct libevdev *dev, struct input_event *ev) {
   LOOKUP(has_property, has_property_fn, "libevdev_has_property");
-  int lock_um = click_lock_um, release_us = release_lock_us;
-  if ((lock_um == 0 && release_us == 0) || !has_property ||
+  int generation = conf_generation;
+  if (generation == 0 || !has_property ||
       (ev->type != EV_ABS && ev->type != EV_KEY) ||
       !has_property(dev, INPUT_PROP_BUTTONPAD))
     return;
   if (dev != pad.dev)
     pad_init(dev);
+  if (pad.generation != generation)
+    pad_load(dev, generation);
   if (!pad.usable)
     return;
+  int lock_um = pad.lock_um, release_us = pad.release_us;
 
   if (ev->type == EV_KEY) {
     if (ev->code == BTN_LEFT)
